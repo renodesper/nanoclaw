@@ -1,13 +1,14 @@
 import type { McpServerConfig } from '../../container-config.js';
-import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
-import { getSession } from '../../db/sessions.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import {
   getContainerConfig,
-  updateContainerConfigScalars,
   updateContainerConfigJson,
+  updateContainerConfigScalars,
 } from '../../db/container-configs.js';
+import { getSession } from '../../db/sessions.js';
+import type { AdditionalMount } from '../../modules/mount-security/index.js';
+import { writeSessionMessage } from '../../session-manager.js';
 import type { ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
@@ -276,6 +277,58 @@ registerResource({
           removed: { apt: apt || null, npm: npm || null },
           note: 'Image rebuild required for package changes to take effect.',
         };
+      },
+    },
+    'config add-mount': {
+      access: 'approval',
+      description:
+        'Add a filesystem mount to a group. Requires `ncl groups restart` to take effect. ' +
+        'Use --id <group-id> --host-path <mac-path> [--container-path <name>] [--readonly]. ' +
+        'Mounts appear at /workspace/extra/<container-path> inside the container.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const hostPath = args['host_path'] as string;
+        if (!hostPath) throw new Error('--host-path is required');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const containerPath = args['container_path'] as string | undefined;
+        const readonly = args.readonly !== 'false' && args.readonly !== false;
+        const mount: AdditionalMount = { hostPath, readonly };
+        if (containerPath) mount.containerPath = containerPath;
+
+        const mounts = JSON.parse(row.additional_mounts) as AdditionalMount[];
+        const existingIndex = mounts.findIndex((m) => m.hostPath === hostPath);
+        if (existingIndex >= 0) {
+          mounts[existingIndex] = mount;
+        } else {
+          mounts.push(mount);
+        }
+
+        updateContainerConfigJson(id, 'additional_mounts', mounts);
+        return { added: mount, mounts };
+      },
+    },
+    'config remove-mount': {
+      access: 'approval',
+      description:
+        'Remove a filesystem mount from a group. Requires `ncl groups restart` to take effect. ' +
+        'Use --id <group-id> --host-path <mac-path>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const hostPath = args['host_path'] as string;
+        if (!hostPath) throw new Error('--host-path is required');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const mounts = JSON.parse(row.additional_mounts) as AdditionalMount[];
+        const filtered = mounts.filter((m) => m.hostPath !== hostPath);
+        updateContainerConfigJson(id, 'additional_mounts', filtered);
+        return { removed: hostPath, mounts: filtered };
       },
     },
   },

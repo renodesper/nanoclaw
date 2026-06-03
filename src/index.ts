@@ -4,6 +4,7 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
+import fs from 'fs';
 import path from 'path';
 
 import { backfillContainerConfigs } from './backfill-container-configs.js';
@@ -63,8 +64,38 @@ import { startCliServer, stopCliServer } from './cli/socket-server.js';
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
+const PID_FILE = path.join(DATA_DIR, 'nanoclaw.pid');
+
+function checkExistingInstance(): number | null {
+  try {
+    const pid = parseInt(fs.readFileSync(PID_FILE, 'utf-8').trim(), 10);
+    if (isNaN(pid)) return null;
+    try {
+      process.kill(pid, 0); // throws if PID not running
+      return pid;
+    } catch {
+      return null; // stale PID file from a previous crash
+    }
+  } catch {
+    return null; // no PID file
+  }
+}
+
 async function main(): Promise<void> {
-  log.info('NanoClaw starting');
+  // Guard against duplicate instances — must run before enforceStartupBackoff
+  // so a rejected duplicate doesn't increment the crash counter.
+  const existingPid = checkExistingInstance();
+  if (existingPid !== null) {
+    log.error('Duplicate instance detected — another NanoClaw is already running', {
+      existingPid,
+      ourPid: process.pid,
+    });
+    process.exit(0);
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(PID_FILE, String(process.pid));
+
+  log.info('NanoClaw starting', { pid: process.pid });
 
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
@@ -182,7 +213,10 @@ async function main(): Promise<void> {
 
 /** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
-  log.info('Shutdown signal received', { signal });
+  log.info('Shutdown signal received', { signal, pid: process.pid });
+  try {
+    fs.unlinkSync(PID_FILE);
+  } catch {}
   for (const cb of getShutdownCallbacks()) {
     try {
       await cb();

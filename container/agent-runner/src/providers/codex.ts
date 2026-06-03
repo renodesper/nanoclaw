@@ -32,8 +32,11 @@ import {
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
-/** Hard ceiling for a single turn. Guards against app-server wedging. */
-const TURN_TIMEOUT_MS = 5 * 60 * 1000;
+/** Hard ceiling for a single turn. Guards against app-server wedging.
+ *  Override via CODEX_TURN_TIMEOUT_MS env var (milliseconds). */
+const TURN_TIMEOUT_MS = process.env.CODEX_TURN_TIMEOUT_MS
+  ? parseInt(process.env.CODEX_TURN_TIMEOUT_MS, 10)
+  : 10 * 60 * 1000;
 
 // ── System-prompt assembly ──────────────────────────────────────────────────
 // Codex's app-server doesn't expand Claude Code's `@-import` syntax in
@@ -271,8 +274,11 @@ async function* runOneTurn(
         break;
       }
       case 'thread/status/changed': {
-        const status = params.status as string | undefined;
-        if (status) buffer.push({ type: 'progress', message: `status: ${status}` });
+        const status = params.status;
+        if (status != null) {
+          const statusStr = typeof status === 'string' ? status : JSON.stringify(status);
+          buffer.push({ type: 'progress', message: `status: ${statusStr}` });
+        }
         break;
       }
       default:

@@ -62,6 +62,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     log(`Resuming agent session ${continuation}`);
   }
 
+  // On the first turn after resuming a compacted session, the model may have
+  // lost the <message to="..."> wrapping discipline (the behavioral pattern
+  // gets summarized away during compaction). Inject a one-shot reminder
+  // prepended to the first prompt, mirroring what the 'compacted' event
+  // handler does for mid-run compactions.
+  let needsResumeReminder = !!continuation;
+
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
@@ -163,9 +170,22 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
-    const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+    let prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+
+    if (needsResumeReminder) {
+      needsResumeReminder = false;
+      const destinations = getAllDestinations();
+      if (destinations.length > 1) {
+        const names = destinations.map((d) => d.name).join(', ');
+        prompt =
+          `[system] Resuming after a previous session. Reminder: you have ${destinations.length} destinations (${names}). ` +
+          `Always wrap responses in <message to="name">...</message> blocks. Bare text goes to the scratchpad only.\n\n` +
+          prompt;
+        log(`Injected resume reminder for ${destinations.length} destinations`);
+      }
+    }
 
     const query = config.provider.query({
       prompt,

@@ -24,6 +24,7 @@ ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=52.2.1
 ARG BUN_VERSION=1.3.12
 ARG CODEX_VERSION=0.124.0
+ARG UV_VERSION=0.7.8
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -70,6 +71,12 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
     install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun && \
     rm -rf /root/.bun
+
+# ---- uv (Python package manager + uvx) ---------------------------------------
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv && \
+    install -m 0755 /root/.local/bin/uvx /usr/local/bin/uvx && \
+    rm -f /root/.local/bin/uv /root/.local/bin/uvx
 
 # ---- agent-runner deps -------------------------------------------------------
 # Deps are cached independently of CLI versions. Source is NOT baked in —

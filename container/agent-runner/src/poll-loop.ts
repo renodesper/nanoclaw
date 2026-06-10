@@ -100,12 +100,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     log(`Resuming agent session ${continuation}`);
   }
 
-  // On the first turn after resuming a compacted session, the model may have
-  // lost the <message to="..."> wrapping discipline (the behavioral pattern
-  // gets summarized away during compaction). Inject a one-shot reminder
-  // prepended to the first prompt, mirroring what the 'compacted' event
-  // handler does for mid-run compactions.
-  let needsResumeReminder = !!continuation;
+  // Inject a one-shot format reminder on the very first turn of every container
+  // run — whether starting fresh or resuming a compacted session. The model
+  // sometimes doesn't pick up the <message to="..."> wrapping discipline from
+  // the system prompt alone on turn 1, leading to bare-text output that gets
+  // dropped as scratchpad. A single prepended reminder anchors the behavior
+  // before the first response, eliminating the extra round-trip from
+  // unwrappedNudge. Cleared after one use.
+  let needsFormatReminder = true;
 
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
@@ -225,16 +227,21 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
-    if (needsResumeReminder) {
-      needsResumeReminder = false;
+    if (needsFormatReminder) {
+      needsFormatReminder = false;
       const destinations = getAllDestinations();
-      if (destinations.length > 1) {
+      if (destinations.length === 1) {
+        prompt =
+          `[system] Reminder: wrap every response in <message to="${destinations[0].name}">...</message>. Bare text is not delivered.\n\n` +
+          prompt;
+        log(`Injected format reminder for single destination "${destinations[0].name}"`);
+      } else if (destinations.length > 1) {
         const names = destinations.map((d) => d.name).join(', ');
         prompt =
-          `[system] Resuming after a previous session. Reminder: you have ${destinations.length} destinations (${names}). ` +
+          `[system] Reminder: you have ${destinations.length} destinations (${names}). ` +
           `Always wrap responses in <message to="name">...</message> blocks. Bare text goes to the scratchpad only.\n\n` +
           prompt;
-        log(`Injected resume reminder for ${destinations.length} destinations`);
+        log(`Injected format reminder for ${destinations.length} destinations`);
       }
     }
 
@@ -452,6 +459,10 @@ async function processQuery(
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  // Suppress duplicate error notifications within a single turn — the
+  // provider may fire multiple error events for successive retry attempts.
+  let errorNotified = false;
+
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -466,6 +477,22 @@ async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'error' && event.retryable && !errorNotified) {
+        // Retryable errors are transient (rate limits, network blips). The
+        // provider retries automatically, so the turn may still succeed — but
+        // the user deserves to know something went wrong. Non-retryable errors
+        // are handled by the outer catch which already writes a failure message.
+        errorNotified = true;
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({
+            text: humanizeProviderError(event.message, true),
+          }),
+        });
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -477,15 +504,31 @@ async function processQuery(
         if (event.text) {
           const { hasUnwrapped } = dispatchResultText(event.text, routing);
           if (hasUnwrapped && !unwrappedNudged) {
-            unwrappedNudged = true;
-            const destinations = getAllDestinations();
-            const names = destinations.map((d) => d.name).join(', ');
-            query.push(
-              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
-                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                `Your destinations: ${names}. ` +
-                `Please re-send your response with the correct wrapping.</system>`,
-            );
+            // Provider-generated error text (e.g. "API Error: 529 Overloaded")
+            // is returned as bare result text — it is not model output and
+            // cannot be re-wrapped. Forward it directly to the routing
+            // destination instead of nudging, which would trigger a confusing
+            // loop where the model tries to re-send something it never wrote.
+            if (/^API Error:|session limit/i.test(event.text.trim())) {
+              writeMessageOut({
+                id: generateId(),
+                kind: 'chat',
+                platform_id: routing.platformId,
+                channel_type: routing.channelType,
+                thread_id: routing.threadId,
+                content: JSON.stringify({ text: humanizeProviderError(event.text) }),
+              });
+            } else {
+              unwrappedNudged = true;
+              const destinations = getAllDestinations();
+              const names = destinations.map((d) => d.name).join(', ');
+              query.push(
+                `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                  `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                  `Your destinations: ${names}. ` +
+                  `Please re-send your response with the correct wrapping.</system>`,
+              );
+            }
           }
         }
       }
@@ -496,6 +539,37 @@ async function processQuery(
   }
 
   return { continuation: queryContinuation };
+}
+
+/**
+ * Convert raw provider error text into a human-friendly Indonesian message.
+ * Handles the three common cases: overloaded (529), session/usage limits,
+ * and generic API errors.
+ */
+function humanizeProviderError(raw: string, isRetrying = false): string {
+  const t = raw.trim();
+
+  if (/session limit/i.test(t)) {
+    const resetMatch = t.match(/resets?\s+([^\s·]+(?:\s+\([^)]+\))?)/i);
+    const resetInfo = resetMatch ? ` Batas reset: **${resetMatch[1]}**` : '';
+    return `⏳ Batas sesi harian Claude sudah tercapai.${resetInfo}\nSilakan coba lagi setelah batas direset.`;
+  }
+
+  if (/529|overload/i.test(t)) {
+    return isRetrying
+      ? `😓 Server Claude sedang kelebihan beban — sedang mencoba ulang, mohon tunggu sebentar...`
+      : `😓 Server Claude sedang kelebihan beban (529). Ini biasanya bersifat sementara.\nCoba lagi dalam beberapa menit. Jika masalah berlanjut, cek: https://status.claude.com`;
+  }
+
+  if (/rate.?limit|too many request/i.test(t)) {
+    return isRetrying
+      ? `⏱️ Rate limit Claude API — sedang mencoba ulang...`
+      : `⏱️ Terlalu banyak permintaan ke Claude API. Mohon tunggu sebentar sebelum mencoba lagi.`;
+  }
+
+  return isRetrying
+    ? `🔄 Gangguan sementara ke API, sedang mencoba ulang...`
+    : `⚠️ Error API: ${t}`;
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {

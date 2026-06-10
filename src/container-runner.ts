@@ -136,7 +136,9 @@ async function spawnContainer(session: Session): Promise<void> {
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
-  const agentIdentifier = agentGroup.id;
+  // OneCLI requires identifiers to start with a letter; UUIDs may start with
+  // a digit, so prefix with "ag-" when needed.
+  const agentIdentifier = /^[a-zA-Z]/.test(agentGroup.id) ? agentGroup.id : `ag-${agentGroup.id}`;
   const args = await buildContainerArgs(
     mounts,
     containerName,

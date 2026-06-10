@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "meta-ads-integration": {
+      "source": "finsilabs/awesome-ecommerce-skills",
+      "sourceType": "github",
+      "skillPath": "skills/marketing-growth/meta-ads-integration/SKILL.md",
+      "computedHash": "ee0232366c86ec4ce69c43839fd586bbb20d872cc2f7223ae2661b0e1265ea68"
+    }
+  }
+}

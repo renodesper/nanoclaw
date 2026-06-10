@@ -26,7 +26,7 @@ NanoClaw provides that same core functionality, but in a codebase small enough t
 ## Quick Start
 
 ```bash
-git clone https://github.com/qwibitai/nanoclaw.git nanoclaw-v2
+git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
 cd nanoclaw-v2
 bash nanoclaw.sh
 ```
@@ -39,7 +39,7 @@ bash nanoclaw.sh
 Run from a fresh v2 checkout next to your v1 install:
 
 ```bash
-git clone https://github.com/qwibitai/nanoclaw.git nanoclaw-v2
+git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
 cd nanoclaw-v2
 bash migrate-v2.sh
 ```
@@ -163,7 +163,7 @@ Key files:
 
 **Why Docker?**
 
-Docker provides cross-platform support (macOS, Linux and Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime. For additional isolation, [Docker Sandboxes](docs/docker-sandboxes.md) run each container inside a micro VM.
+Docker provides cross-platform support (macOS, Linux and Windows via WSL2) and a mature ecosystem. On macOS, Apple Container is also supported as a lighter-weight native runtime. For additional isolation, [Docker Sandboxes](docs/docker-sandboxes.md) run each container inside a micro VM.
 
 **Can I run this on Linux or Windows?**
 

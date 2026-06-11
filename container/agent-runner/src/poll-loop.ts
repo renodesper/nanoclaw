@@ -1,20 +1,20 @@
-import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
-import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
-import { writeMessageOut } from './db/messages-out.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
-import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import { clearStaleProcessingAcks, getInboundDb, touchHeartbeat } from './db/connection.js';
+import { getPendingMessages, markCompleted, markProcessing, type MessageInRow } from './db/messages-in.js';
+import { writeMessageOut } from './db/messages-out.js';
+import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
+import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
-  formatMessages,
-  extractRouting,
   categorizeMessage,
+  extractRouting,
+  formatMessages,
   isClearCommand,
   isRunnerCommand,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -117,9 +117,25 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   let isFirstPoll = true;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    const allPending = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
     isFirstPoll = false;
     pollCount++;
+
+    // Reaction-only messages (add_reaction MCP tool output) carry no text and
+    // should not wake the agent. Mark them completed immediately to prevent
+    // feedback loops between agents echoing reactions back and forth.
+    const reactionIds: string[] = [];
+    const messages = allPending.filter((m) => {
+      if (isReactionOnly(m)) {
+        reactionIds.push(m.id);
+        return false;
+      }
+      return true;
+    });
+    if (reactionIds.length > 0) {
+      markCompleted(reactionIds);
+      log(`Skipped ${reactionIds.length} reaction-only message(s)`);
+    }
 
     // Periodic heartbeat so we know the loop is alive
     if (pollCount % 30 === 0) {
@@ -389,18 +405,28 @@ async function processQuery(
         const newMessages = pending.filter((m) => m.kind !== 'system');
         if (newMessages.length === 0) return;
 
-        const newIds = newMessages.map((m) => m.id);
+        // Skip reaction-only messages in follow-ups too — same rationale as
+        // the initial-batch filter above.
+        const followupReactionIds = newMessages.filter((m) => isReactionOnly(m)).map((m) => m.id);
+        if (followupReactionIds.length > 0) {
+          markCompleted(followupReactionIds);
+          log(`Skipped ${followupReactionIds.length} follow-up reaction-only message(s)`);
+        }
+        const nonReactionMessages = newMessages.filter((m) => !isReactionOnly(m));
+        if (nonReactionMessages.length === 0) return;
+
+        const newIds = nonReactionMessages.map((m) => m.id);
         markProcessing(newIds);
 
         // Run pre-task scripts on follow-ups too — without this, a task that
         // arrives during an active query (e.g. a */10 monitoring cron) bypasses
         // its script gate and always wakes the agent, defeating the gate.
         // Mirrors the initial-batch hook above.
-        let keep = newMessages;
+        let keep = nonReactionMessages;
         let skipped: string[] = [];
         // MODULE-HOOK:scheduling-pre-task-followup:start
         const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
-        const preTask = await applyPreTaskScripts(newMessages);
+        const preTask = await applyPreTaskScripts(nonReactionMessages);
         keep = preTask.keep;
         skipped = preTask.skipped;
         if (skipped.length > 0) {
@@ -567,9 +593,7 @@ function humanizeProviderError(raw: string, isRetrying = false): string {
       : `⏱️ Terlalu banyak permintaan ke Claude API. Mohon tunggu sebentar sebelum mencoba lagi.`;
   }
 
-  return isRetrying
-    ? `🔄 Gangguan sementara ke API, sedang mencoba ulang...`
-    : `⚠️ Error API: ${t}`;
+  return isRetrying ? `🔄 Gangguan sementara ke API, sedang mencoba ulang...` : `⚠️ Error API: ${t}`;
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
@@ -614,6 +638,11 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
     const toName = match[1];
     const body = match[2].trim();
     lastIndex = MESSAGE_RE.lastIndex;
+
+    if (!body) {
+      log(`Dropping empty <message to="${toName}"> block — nothing to send`);
+      continue;
+    }
 
     const dest = findByName(toName);
     if (!dest) {
@@ -686,4 +715,19 @@ function resolveDestinationThread(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Detect reaction-only messages (from the add_reaction MCP tool or agent
+ * echo). These carry `{"operation":"reaction",...}` with no `.text` field and
+ * should not wake the agent — doing so creates feedback loops where agents
+ * keep reacting to each other's reactions.
+ */
+function isReactionOnly(m: MessageInRow): boolean {
+  try {
+    const parsed = JSON.parse(m.content);
+    return parsed.operation === 'reaction' && !parsed.text;
+  } catch {
+    return false;
+  }
 }

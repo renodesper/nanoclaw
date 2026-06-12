@@ -11,6 +11,7 @@ const CONFIG_PATH = '/workspace/agent/container.json';
 
 export interface RunnerConfig {
   provider: string;
+  providerFallback?: { name: string; model?: string; effort?: string }[];
   assistantName: string;
   groupName: string;
   agentGroupId: string;
@@ -40,6 +41,9 @@ export function loadConfig(): RunnerConfig {
 
   _config = {
     provider: (raw.provider as string) || 'claude',
+    providerFallback: Array.isArray(raw.providerFallback)
+      ? (raw.providerFallback as { name: string; model?: string; effort?: string }[])
+      : undefined,
     assistantName: (raw.assistantName as string) || '',
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',

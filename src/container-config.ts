@@ -29,6 +29,35 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+export interface ProviderFallbackEntry {
+  name: string;
+  model?: string;
+  effort?: string;
+}
+
+/**
+ * Normalize provider_fallback JSON from DB into typed entries.
+ * Accepts both simple strings and objects with model/effort overrides.
+ *
+ *   ["opencode", "codex"]
+ *   [{"name":"opencode","model":"gpt-4o"},{"name":"codex"}]
+ */
+export function normalizeProviderFallback(raw: unknown): ProviderFallbackEntry[] | undefined {
+  if (!raw || !Array.isArray(raw) || raw.length === 0) return undefined;
+  return raw.map((entry) => {
+    if (typeof entry === 'string') return { name: entry };
+    if (typeof entry === 'object' && entry !== null && typeof (entry as Record<string, unknown>).name === 'string') {
+      const e = entry as Record<string, unknown>;
+      return {
+        name: e.name as string,
+        model: typeof e.model === 'string' ? (e.model as string) : undefined,
+        effort: typeof e.effort === 'string' ? (e.effort as string) : undefined,
+      };
+    }
+    throw new Error(`Invalid fallback entry: ${JSON.stringify(entry)}`);
+  });
+}
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -37,6 +66,7 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
+  providerFallback?: ProviderFallbackEntry[];
   groupName?: string;
   assistantName?: string;
   agentGroupId?: string;
@@ -57,6 +87,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
     skills: JSON.parse(row.skills) as string[] | 'all',
     provider: row.provider ?? undefined,
+    providerFallback: row.provider_fallback ? normalizeProviderFallback(JSON.parse(row.provider_fallback)) : undefined,
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,

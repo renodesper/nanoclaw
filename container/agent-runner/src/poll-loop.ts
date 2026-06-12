@@ -13,7 +13,8 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions } from './providers/types.js';
+import { createProvider } from './providers/factory.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -59,6 +60,14 @@ export interface PollLoopConfig {
    * resurrect a stale id from a different backend.
    */
   providerName: string;
+  /**
+   * Ordered list of fallback provider names to try when the primary provider
+   * hits quota/rate-limit exhaustion. Each is tried in order; the first to
+   * succeed wins. Undefined/null means no fallback — behave as single provider.
+   */
+  providerFallback?: { name: string; model?: string; effort?: string }[];
+  /** Options to use when constructing fallback provider instances. */
+  providerOptions: ProviderOptions;
   cwd: string;
   systemContext?: {
     instructions?: string;
@@ -261,39 +270,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
     }
 
-    const query = config.provider.query({
-      prompt,
-      continuation,
-      cwd: config.cwd,
-      systemContext: config.systemContext,
-    });
-
-    // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
-    // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
-    // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await executeWithFallback(config, prompt, messages, routing, processingIds, continuation);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
-        setContinuation(config.providerName, continuation);
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Query error: ${errMsg}`);
-
-      // Stale/corrupt continuation recovery: ask the provider whether
-      // this error means the stored continuation is unusable, and clear
-      // it so the next attempt starts fresh.
-      if (continuation && config.provider.isSessionInvalid(err)) {
-        log(`Stale session detected (${continuation}) — clearing for next retry`);
-        continuation = undefined;
-        clearContinuation(config.providerName);
-      }
-
-      // Write error response so the user knows something went wrong
+      log(`Query error (all providers exhausted): ${errMsg}`);
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
@@ -311,6 +298,129 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+}
+
+/**
+ * Execute provider query with automatic fallback on quota exhaustion.
+ *
+ * Tries the primary provider first, then each provider in the fallback chain
+ * in order. Non-quota errors short-circuit the chain immediately. On fallback,
+ * the user is notified and the new provider starts a fresh session with a
+ * summary of recent messages (full transcript is lost across providers).
+ */
+async function executeWithFallback(
+  config: PollLoopConfig,
+  prompt: string,
+  messages: MessageInRow[],
+  routing: RoutingContext,
+  processingIds: string[],
+  continuation: string | undefined,
+): Promise<QueryResult> {
+  const fallbacks = config.providerFallback ?? [];
+
+  // ── Primary provider ──
+  let query = config.provider.query({
+    prompt,
+    continuation,
+    cwd: config.cwd,
+    systemContext: config.systemContext,
+  });
+
+  try {
+    const result = await processQuery(query, routing, processingIds, config.providerName);
+    if (result.continuation && result.continuation !== continuation) {
+      setContinuation(config.providerName, result.continuation);
+    }
+    return { continuation: result.continuation };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log(`Query error (${config.providerName}): ${errMsg}`);
+
+    if (continuation && config.provider.isSessionInvalid(err)) {
+      log(`Stale session detected (${continuation}) — clearing for next retry`);
+      clearContinuation(config.providerName);
+      continuation = undefined;
+    }
+
+    if (fallbacks.length === 0 || !config.provider.isQuotaExhausted(err)) {
+      throw err;
+    }
+
+    log(`Primary provider ${config.providerName} quota exhausted, trying ${fallbacks.length} fallback(s)`);
+  }
+
+  // ── Fallback providers ──
+  for (let i = 0; i < fallbacks.length; i++) {
+    const entry = fallbacks[i];
+
+    writeMessageOut({
+      id: generateId(),
+      kind: 'chat',
+      platform_id: routing.platformId,
+      channel_type: routing.channelType,
+      thread_id: routing.threadId,
+      content: JSON.stringify({
+        text: `⚠️ Beralih ke provider **${entry.name}** karena provider sebelumnya terkena rate limit.`,
+      }),
+    });
+
+    const fallbackProvider = createProvider(entry.name, {
+      ...config.providerOptions,
+      model: entry.model ?? config.providerOptions.model,
+      effort: entry.effort ?? config.providerOptions.effort,
+    });
+    const fallbackPrompt = buildFallbackPrompt(messages);
+
+    query = fallbackProvider.query({
+      prompt: fallbackPrompt,
+      continuation: undefined,
+      cwd: config.cwd,
+      systemContext: config.systemContext,
+    });
+
+    try {
+      await processQuery(query, routing, processingIds, entry.name);
+      log(`Fallback to ${entry.name} succeeded`);
+      return { continuation: undefined };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log(`Fallback provider ${entry.name} error: ${errMsg}`);
+
+      if (i < fallbacks.length - 1 && fallbackProvider.isQuotaExhausted(err)) {
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  throw new Error('All providers exhausted');
+}
+
+/**
+ * Build a fallback prompt when switching providers. Includes recent user
+ * messages so the new provider has enough context to continue, even though
+ * the full conversation transcript is not transferable between providers.
+ */
+function buildFallbackPrompt(messages: MessageInRow[]): string {
+  const recentTexts = messages
+    .slice(-5)
+    .map((m) => {
+      try {
+        const parsed = JSON.parse(m.content);
+        return parsed.text || JSON.stringify(parsed).slice(0, 200);
+      } catch {
+        return m.content.slice(0, 200);
+      }
+    })
+    .join('\n');
+
+  return (
+    '<system>Provider sebelumnya terkena rate limit. Melanjutkan dengan provider cadangan ' +
+    'sebagai sesi baru — riwayat percakapan penuh tidak tersedia.\n\nPesan terbaru:\n\n' +
+    recentTexts +
+    '\n\nLanjutkan percakapan berdasarkan pesan-pesan di atas.</system>'
+  );
 }
 
 /**
@@ -519,6 +629,13 @@ async function processQuery(
             text: humanizeProviderError(event.message, true),
           }),
         });
+      } else if (event.type === 'error' && event.classification === 'quota') {
+        // Non-retryable quota error — throw so the fallback chain can catch it
+        // and try the next provider. The Claude SDK returns these as result
+        // text rather than throwing, so we must detect them here in the event
+        // stream and force an exception.
+        log(`Quota error detected in event stream, throwing for fallback`);
+        throw new Error(`Quota exhausted: ${event.message}`);
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -536,13 +653,21 @@ async function processQuery(
             // destination instead of nudging, which would trigger a confusing
             // loop where the model tries to re-send something it never wrote.
             if (/^API Error:|session limit/i.test(event.text.trim())) {
+              const msg = event.text.trim();
+              // Throw quota errors so fallback chain can catch them.
+              // The Claude SDK often returns session/rate limit errors as
+              // result text rather than error events or exceptions.
+              if (isQuotaText(msg)) {
+                log(`Quota error in result text, throwing for fallback: ${msg.slice(0, 100)}`);
+                throw new Error(msg);
+              }
               writeMessageOut({
                 id: generateId(),
                 kind: 'chat',
                 platform_id: routing.platformId,
                 channel_type: routing.channelType,
                 thread_id: routing.threadId,
-                content: JSON.stringify({ text: humanizeProviderError(event.text) }),
+                content: JSON.stringify({ text: humanizeProviderError(msg) }),
               });
             } else {
               unwrappedNudged = true;
@@ -565,6 +690,14 @@ async function processQuery(
   }
 
   return { continuation: queryContinuation };
+}
+
+/**
+ * True if the raw error text indicates quota/rate-limit exhaustion that
+ * should trigger provider fallback (vs. a transient error worth retrying).
+ */
+function isQuotaText(raw: string): boolean {
+  return /session.?limit|rate.?limit|quota.*exceeded|usage.*limit|529.*overload/i.test(raw.trim());
 }
 
 /**

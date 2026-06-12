@@ -3,6 +3,7 @@ import { getDb } from './connection.js';
 
 const SCALAR_COLUMNS = new Set([
   'provider',
+  'provider_fallback',
   'model',
   'effort',
   'image_tag',
@@ -55,7 +56,14 @@ export function updateContainerConfigScalars(
   updates: Partial<
     Pick<
       ContainerConfigRow,
-      'provider' | 'model' | 'effort' | 'image_tag' | 'assistant_name' | 'max_messages_per_prompt' | 'cli_scope'
+      | 'provider'
+      | 'provider_fallback'
+      | 'model'
+      | 'effort'
+      | 'image_tag'
+      | 'assistant_name'
+      | 'max_messages_per_prompt'
+      | 'cli_scope'
     >
   >,
 ): void {

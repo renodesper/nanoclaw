@@ -16,6 +16,14 @@ export interface AgentProvider {
   isSessionInvalid(err: unknown): boolean;
 
   /**
+   * True if this error represents a quota/rate-limit exhaustion that is
+   * non-retryable and should be handled by falling back to another provider.
+   * Distinct from isSessionInvalid (stale continuation) — this is for billing,
+   * usage, and rate-limit errors that require switching providers entirely.
+   */
+  isQuotaExhausted(err: unknown): boolean;
+
+  /**
    * Optional pre-resume maintenance. Given the stored continuation token,
    * decide whether its backing transcript has grown too large or too old to
    * resume cheaply. Return a non-null reason string to tell the caller to drop

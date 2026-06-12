@@ -31,6 +31,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import type { ProviderOptions } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -86,18 +87,22 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
 
-  const provider = createProvider(providerName, {
+  const providerOptions: ProviderOptions = {
     assistantName: config.assistantName || undefined,
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     model: config.model,
     effort: config.effort,
-  });
+  };
+
+  const provider = createProvider(providerName, providerOptions);
 
   await runPollLoop({
     provider,
     providerName,
+    providerFallback: config.providerFallback,
+    providerOptions,
     cwd: CWD,
     systemContext: { instructions },
   });

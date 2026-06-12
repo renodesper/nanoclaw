@@ -231,14 +231,47 @@ function resolveProviderContribution(
   containerConfig: import('./container-config.js').ContainerConfig,
 ): { provider: string; contribution: ProviderContainerContribution } {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
+
+  const sDir = sessionDir(agentGroup.id, session.id);
+  const ctx = { sessionDir: sDir, agentGroupId: agentGroup.id, hostEnv: process.env };
+
   const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        hostEnv: process.env,
-      })
-    : {};
+  const contribution = fn ? fn(ctx) : {};
+
+  // Merge fallback provider contributions so the container has the necessary
+  // env vars, mounts, and XDG state for fallback providers at runtime.
+  const fallbacks = containerConfig.providerFallback;
+  if (fallbacks && fallbacks.length > 0) {
+    const mergedMounts = contribution.mounts ? [...contribution.mounts] : [];
+    const mergedEnv: Record<string, string> = { ...(contribution.env ?? {}) };
+
+    for (const entry of fallbacks) {
+      if (entry.name === provider) continue;
+      const fallbackFn = getProviderContainerConfig(entry.name);
+      if (!fallbackFn) continue;
+      const fbContribution = fallbackFn(ctx);
+      if (fbContribution.mounts) {
+        for (const m of fbContribution.mounts) {
+          if (!mergedMounts.some((mm) => mm.containerPath === m.containerPath)) {
+            mergedMounts.push(m);
+          }
+        }
+      }
+      if (fbContribution.env) {
+        for (const [key, value] of Object.entries(fbContribution.env)) {
+          if (!(key in mergedEnv)) mergedEnv[key] = value;
+        }
+      }
+    }
+    return {
+      provider,
+      contribution: {
+        ...(mergedMounts.length > 0 ? { mounts: mergedMounts } : {}),
+        ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
+      },
+    };
+  }
+
   return { provider, contribution };
 }
 

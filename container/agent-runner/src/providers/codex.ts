@@ -114,6 +114,11 @@ export class CodexProvider implements AgentProvider {
     return STALE_THREAD_RE.test(msg);
   }
 
+  isQuotaExhausted(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /rate.?limit|quota.*exceeded|billing.*not.*active|insufficient_quota|429/i.test(msg);
+  }
+
   query(input: QueryInput): AgentQuery {
     const pending: string[] = [];
     let waiting: (() => void) | null = null;

@@ -18,6 +18,10 @@ export class MockProvider implements AgentProvider {
     return false;
   }
 
+  isQuotaExhausted(_err: unknown): boolean {
+    return false;
+  }
+
   query(input: QueryInput): AgentQuery {
     const pending: string[] = [];
     let waiting: (() => void) | null = null;
